@@ -1,0 +1,52 @@
+# Complete Requirements for Toxicology Research API
+
+# Core API Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# Async HTTP client for API calls
+aiohttp==3.9.1
+
+# Google Scholar scraping with Apify
+apify-client==1.7.1
+
+# Environment variables management
+python-dotenv==1.0.0
+
+# Additional useful packages for production
+# Request ID tracking and correlation
+starlette==0.27.0
+
+# JSON handling improvements
+orjson==3.9.10
+
+# Optional: For development and testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2  # For testing HTTP endpoints
+
+# Optional: Code quality tools (uncomment if needed)
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Optional: For logging and monitoring (uncomment if needed)
+structlog==23.2.0
+rich==13.7.0
+
+# Optional: For caching (uncomment if needed)
+redis==5.0.1
+aioredis==2.0.1
+
+# Standard library modules (included in Python, listed for reference)
+# These are already part of Python and don't need to be installed:
+asyncio
+#dataclasses (Python 3.7+)
+# - typing (Python 3.5+)
+# - json
+# - datetime
+# - os
+# - logging
+# - re
+# - urllib
