@@ -1,16 +1,18 @@
 """
-Enhanced Google Scholar Scraper with Article Content Extraction
-Uses Marco Gullo's scraper + Apify's Article Extractor Smart
+Enhanced Google Scholar Scraper with Cheerio/PDF Scrapers
+Uses Marco Gullo for Google Scholar search + jirimoravcik PDF scraper + Cheerio for content extraction
 """
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Set
 import json
 from datetime import datetime
 import os
 from apify_client import ApifyClient
+import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,14 +40,71 @@ class SearchResult:
     citation_count: int
     year: int
     search_term: str
-    full_text: Optional[str] = None  # Added for extracted content
-    content_extracted: bool = False  # Flag to track extraction status
-    extraction_method: Optional[str] = None  # Track how content was extracted
+    full_text: Optional[str] = None
+    content_extracted: bool = False
+    extraction_method: Optional[str] = None
+    extraction_scraper: Optional[str] = None
     
+    def get_text_length(self) -> int:
+        """Get length of full text"""
+        return len(self.full_text) if self.full_text else 0
+
+def format_text_content(text: str) -> str:
+    """Format and clean text content for better readability"""
+    if not text:
+        return ""
+    
+    # Remove common UI/navigation elements
+    text = re.sub(r'(Download PDF|View PDF|Subscribe|Login|Register)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Copyright.*?\d{4}', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'ISSN.*?\d{4}-\d{4}', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'DOI.*?10\.\d{4}\/[^\s]+', '', text, flags=re.IGNORECASE)
+    
+    # Clean up excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    
+    # Add proper spacing after periods if missing
+    text = re.sub(r'\.([A-Z])', r'. \1', text)
+    
+    return text.strip()
+
+def format_abstract(abstract: str) -> str:
+    """Format abstract text for better readability"""
+    if not abstract:
+        return ""
+    
+    # Clean the abstract
+    abstract = format_text_content(abstract)
+    
+    # Remove common prefixes
+    abstract = re.sub(r'^(Abstract\s*:?\s*|Summary\s*:?\s*)', '', abstract, flags=re.IGNORECASE)
+    
+    # Ensure minimum length for quality
+    if len(abstract) < 50:
+        return ""
+    
+    # Add structure for better readability
+    structure_patterns = [
+        (r'(Background[:.])', r'\n\1'),
+        (r'(Objective[:.])', r'\n\1'),
+        (r'(Methods?[:.])', r'\n\1'),
+        (r'(Results?[:.])', r'\n\1'),
+        (r'(Conclusions?[:.])', r'\n\1'),
+        (r'(Purpose[:.])', r'\n\1')
+    ]
+    
+    for pattern, replacement in structure_patterns:
+        abstract = re.sub(pattern, replacement, abstract, flags=re.IGNORECASE)
+    
+    return abstract.strip()
+
 class GoogleScholarScraper:
     """
-    Enhanced Google Scholar scraper with full content extraction
-    Uses Marco Gullo's scraper + Apify's Article Extractor
+    Enhanced Google Scholar scraper
+    Phase 1: Marco Gullo's scraper for Google Scholar search
+    Phase 2: jirimoravcik's PDF scraper for PDF content extraction (prioritized)
+    Phase 3: Cheerio scraper for HTML content extraction (fallback)
     """
     
     # Toxicology-specific keywords
@@ -69,15 +128,17 @@ class GoogleScholarScraper:
         self.client = ApifyClient(apify_token)
         self.results = []
         
-        # Using Marco Gullo's Google Scholar scraper
+        # Phase 1: Google Scholar search
         self.scholar_actor_id = "marco.gullo/google-scholar-scraper"
         
-        # Using Apify's Smart Article Extractor
-        self.extractor_actor_id = "lukaskrivka/article-extractor-smart"
+        # Phase 2 & 3: Content extraction (Puppeteer removed)
+        self.pdf_actor_id = "jirimoravcik/pdf-text-extractor"
+        self.cheerio_actor_id = "apify/cheerio-scraper"
         
-        logger.info("Enhanced GoogleScholarScraper initialized")
-        logger.info(f"Scholar Actor: {self.scholar_actor_id}")
-        logger.info(f"Extractor Actor: {self.extractor_actor_id}")
+        logger.info("GoogleScholarScraper initialized")
+        logger.info(f"Scholar search: {self.scholar_actor_id}")
+        logger.info(f"PDF scraper: {self.pdf_actor_id}")
+        logger.info(f"Cheerio scraper: {self.cheerio_actor_id}")
     
     def generate_search_queries(self, compound: CompoundInfo) -> List[str]:
         """Generate targeted search queries for a compound"""
@@ -101,7 +162,7 @@ class GoogleScholarScraper:
                 unique_queries.append(query)
         
         logger.info(f"Generated {len(unique_queries)} search queries")
-        return unique_queries[:15]  # Limit to 15 queries for performance
+        return unique_queries[:5]  # Limit to 5 queries for better performance
     
     async def run_search(self, query: str, max_results: int = 20) -> List[Dict]:
         """
@@ -148,53 +209,249 @@ class GoogleScholarScraper:
             logger.error(f"Error in search for query '{query}': {e}")
             return []
     
-    async def extract_article_content(self, urls: List[str]) -> Dict[str, Dict]:
+    def _is_pdf_url(self, url: str) -> bool:
         """
-        Extract content from article URLs using Apify's Smart Article Extractor
+        Check if URL points to a PDF file
         
         Args:
-            urls (List[str]): List of URLs to extract content from
+            url (str): URL to check
             
         Returns:
-            Dict[str, Dict]: Mapping of URL to extracted content
+            bool: True if URL points to PDF
         """
-        if not urls:
-            return {}
+        if not url:
+            return False
         
-        try:
-            logger.info(f"Extracting content from {len(urls)} URLs")
+        url_lower = url.lower()
+        return (url_lower.endswith('.pdf') or 
+                'filetype=pdf' in url_lower or
+                '/pdf/' in url_lower or
+                'application/pdf' in url_lower)
+    
+    async def _extract_pdf_content(self, pdf_urls: List[str]) -> Dict[str, Dict]:
+        """
+        Extract content from PDF URLs using jirimoravcik's PDF scraper
+        
+        Args:
+            pdf_urls (List[str]): URLs of PDFs to extract
             
-            # Configure the article extractor
+        Returns:
+            Dict[str, Dict]: Extracted content by URL
+        """
+        try:
+            logger.info(f"Extracting PDF content for {len(pdf_urls)} URLs")
+            
+            # Configure PDF scraper with more comprehensive settings
             run_input = {
-                "urls": urls,
-                "outputFormat": "json",
-                "includeMetadata": True,
+                "urls": pdf_urls,
+                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "headless": True,
+                "screenshot": False,
+                "useProxy": True,
                 "timeout": 30,
-                "waitFor": 3,  # Wait 3 seconds for page to load
-                "skipExternalImages": True
+                "extractText": True,
+                "extractFormat": "text",
+                "waitUntil": "networkidle",
+                "maxRetries": 2,
+                "retryDelay": 1000,
+                "ignoreHTTPSErrors": True
             }
             
-            # Run the article extractor
-            run = self.client.actor(self.extractor_actor_id).call(run_input=run_input)
+            # Run the PDF scraper
+            logger.info(f"Starting PDF scraper with input: {run_input}")
+            run = self.client.actor(self.pdf_actor_id).call(run_input=run_input)
             
             # Process results
             content_map = {}
+            item_count = 0
+            
             for item in self.client.dataset(run["defaultDatasetId"]).iterate_items():
+                item_count += 1
                 url = item.get("url")
-                if url:
+                text = item.get("text", "")
+                status = item.get("status", "")
+                error = item.get("error", "")
+                
+                logger.info(f"Processing PDF item {item_count}: {url}")
+                logger.info(f"  Status: {status}")
+                logger.info(f"  Text length: {len(text)}")
+                
+                if error:
+                    logger.warning(f"  Error: {error}")
+                
+                if url and text:
+                    # Format the PDF text
+                    formatted_text = format_text_content(text)
+                    
+                    # Extract abstract from PDF text (try multiple patterns)
+                    abstract = ""
+                    abstract_patterns = [
+                        r'abstract\s*:?\s*(.*?)(?=\n\s*[1-9]\.|introduction|keywords|references)',
+                        r'summary\s*:?\s*(.*?)(?=\n\s*[1-9]\.|introduction|keywords|references)',
+                        r'\nabstract\n(.*?)(?=\nintroduction|\nkeywords|\nreferences)',
+                        r'^abstract[:\s]+(.*?)(?=^introduction|^keywords|^references|^\d+\.)',
+                    ]
+                    
+                    for pattern in abstract_patterns:
+                        abstract_match = re.search(pattern, text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+                        if abstract_match:
+                            abstract = format_abstract(abstract_match.group(1).strip())
+                            break
+                    
                     content_map[url] = {
                         "title": item.get("title", ""),
-                        "text": item.get("text", ""),
-                        "abstract": item.get("excerpt", "") or item.get("description", ""),
+                        "text": formatted_text,
+                        "abstract": abstract,
                         "extracted": True,
-                        "length": len(item.get("text", ""))
+                        "length": len(formatted_text),
+                        "scraper": "pdf_scraper",
+                        "isPdf": True,
+                        "status": status
                     }
+                    logger.info(f"PDF successfully extracted: {url} (length: {len(formatted_text)})")
+                else:
+                    if url:
+                        logger.warning(f"PDF extraction failed for {url}: No text extracted")
+                        # Still add to map but mark as failed
+                        content_map[url] = {
+                            "title": "",
+                            "text": "",
+                            "abstract": "",
+                            "extracted": False,
+                            "length": 0,
+                            "scraper": "pdf_scraper",
+                            "isPdf": True,
+                            "status": status,
+                            "error": error
+                        }
             
-            logger.info(f"Successfully extracted content from {len(content_map)} URLs")
+            logger.info(f"PDF extraction completed. Processed {item_count} items, {len(content_map)} URLs mapped")
             return content_map
             
         except Exception as e:
-            logger.error(f"Error extracting article content: {e}")
+            logger.error(f"Error with PDF scraper: {e}")
+            return {}
+    
+    async def _extract_with_cheerio(self, urls: List[str]) -> Dict[str, Dict]:
+        """
+        Extract content using Cheerio scraper with improved formatting
+        
+        Args:
+            urls (List[str]): URLs to scrape
+            
+        Returns:
+            Dict[str, Dict]: Extracted content by URL
+        """
+        try:
+            logger.info(f"Extracting with Cheerio scraper for {len(urls)} URLs")
+            
+            # Configure Cheerio scraper with enhanced text formatting
+            run_input = {
+                "startUrls": [{"url": url} for url in urls],
+                "pageFunction": r"""
+                    async function pageFunction(context) {
+                        const { $, request } = context;
+                        
+                        // Random delay to avoid being detected as bot
+                        await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
+                        
+                        // Extract title
+                        const title = $('title, h1, .article-title').first().text().trim();
+                        
+                        // Extract abstract with improved selectors
+                        const abstractSelectors = [
+                            '.abstract', '#abstract', '.article-abstract',
+                            '.summary', '.paper-abstract', '.abstracts',
+                            '.entry-summary', '.description'
+                        ];
+                        let abstract = '';
+                        for (const selector of abstractSelectors) {
+                            const element = $(selector);
+                            if (element.length) {
+                                abstract = element.text().trim();
+                                // Clean common prefixes
+                                abstract = abstract.replace(/^(Abstract\s*:?\s*|Summary\s*:?\s*)/i, '');
+                                if (abstract && abstract.length > 50) break;
+                            }
+                        }
+                        
+                        // Extract main content with better selection
+                        const contentSelectors = [
+                            'article', '.article', '.content', 'main', '.main-content',
+                            '.paper-content', '.full-text', '.article-body', '.text'
+                        ];
+                        let content = '';
+                        let maxLength = 0;
+                        
+                        for (const selector of contentSelectors) {
+                            const element = $(selector);
+                            if (element.length) {
+                                // Remove unwanted elements before getting text
+                                element.find('nav, .navigation, .sidebar, .ads').remove();
+                                element.find('.references, .citations').remove();
+                                element.find('script, style').remove();
+                                
+                                const text = element.text().trim();
+                                if (text && text.length > maxLength) {
+                                    content = text;
+                                    maxLength = text.length;
+                                }
+                            }
+                        }
+                        
+                        // Clean and format content
+                        if (content) {
+                            // Remove common UI elements
+                            content = content.replace(/Download PDF|View PDF|Subscribe|Login|Register/gi, '');
+                            content = content.replace(/Copyright.*?\d{4}/gi, '');
+                            content = content.replace(/ISSN.*?\d{4}-\d{4}/gi, '');
+                            // Clean excessive whitespace
+                            content = content.replace(/\s+/g, ' ').trim();
+                        }
+                        
+                        return {
+                            url: request.url,
+                            title,
+                            abstract,
+                            content: content || abstract,
+                            success: !!(content || abstract),
+                            text_length: (content || abstract).length
+                        };
+                    }
+                """,
+                "proxyUrls": ["http://groups-RESIDENTIAL:password@proxy.apify.com:8000"],
+                "timeout": 30
+            }
+            
+            # Run the scraper
+            run = self.client.actor(self.cheerio_actor_id).call(run_input=run_input)
+            
+            # Process results with formatting
+            content_map = {}
+            for item in self.client.dataset(run["defaultDatasetId"]).iterate_items():
+                url = item.get("url")
+                if url and item.get("success"):
+                    # Format the extracted content
+                    content = item.get("content", "")
+                    abstract = item.get("abstract", "")
+                    
+                    formatted_content = format_text_content(content)
+                    formatted_abstract = format_abstract(abstract)
+                    
+                    content_map[url] = {
+                        "title": item.get("title", ""),
+                        "text": formatted_content,
+                        "abstract": formatted_abstract,
+                        "extracted": True,
+                        "length": len(formatted_content),
+                        "scraper": "cheerio"
+                    }
+                    logger.info(f"Cheerio extracted: {url} (length: {len(formatted_content)})")
+            
+            return content_map
+            
+        except Exception as e:
+            logger.error(f"Error with Cheerio scraper: {e}")
             return {}
     
     async def search_compound(self, compound: CompoundInfo, max_results_per_query: int = 15) -> List[SearchResult]:
@@ -208,9 +465,9 @@ class GoogleScholarScraper:
         Returns:
             List[SearchResult]: Search results with extracted content
         """
-        logger.info(f"Starting enhanced search for compound: {compound.name} (CAS: {compound.cas_number})")
+        logger.info(f"Starting search for compound: {compound.name} (CAS: {compound.cas_number})")
         
-        # Phase 1: Search Google Scholar
+        # Phase 1: Search Google Scholar using Marco Gullo's scraper
         logger.info("Phase 1: Searching Google Scholar...")
         queries = self.generate_search_queries(compound)
         
@@ -237,15 +494,15 @@ class GoogleScholarScraper:
         # Convert to SearchResult objects and deduplicate
         search_results = self._process_results(all_results)
         
-        # Phase 2: Extract full content from articles
-        logger.info("Phase 2: Extracting full article content...")
+        # Phase 2 & 3: Extract content from found URLs
+        logger.info("Phase 2: Extracting content from found URLs...")
         search_results = await self._extract_content_from_results(search_results)
         
         logger.info(f"Pipeline complete! Found {len(search_results)} unique papers")
         return search_results
     
     def _process_results(self, raw_results: List[Dict]) -> List[SearchResult]:
-        """Process and deduplicate search results"""
+        """Process and deduplicate search results with improved duplicate detection"""
         seen_titles = set()
         processed_results = []
         
@@ -255,11 +512,31 @@ class GoogleScholarScraper:
                 title = result.get('title', '') or result.get('Title', '')
                 title = title.strip()
                 
+                # Improved duplicate detection: normalize title
+                normalized_title = re.sub(r'[^\w\s]', '', title.lower()).strip()
+                
                 # Skip if we've seen this title or if title is empty
-                if not title or title in seen_titles:
+                if not title or not normalized_title:
                     continue
                 
-                seen_titles.add(title)
+                # Check for similar titles (not just exact matches)
+                is_duplicate = False
+                for seen_title in seen_titles:
+                    # Simple similarity check
+                    words1 = set(normalized_title.split())
+                    words2 = set(seen_title.split())
+                    if words1 and words2:
+                        intersection = len(words1.intersection(words2))
+                        union = len(words1.union(words2))
+                        similarity = intersection / union
+                        if similarity > 0.8:  # 80% similarity threshold
+                            is_duplicate = True
+                            break
+                
+                if is_duplicate:
+                    continue
+                
+                seen_titles.add(normalized_title)
                 
                 # Extract authors
                 authors = result.get('authors', []) or result.get('Authors', [])
@@ -277,11 +554,14 @@ class GoogleScholarScraper:
                            result.get('pdf_link', None) or 
                            result.get('PdfLink', None))
                 
-                # Create SearchResult object
+                # Create SearchResult object with formatted abstract
+                abstract = result.get('abstract', '') or result.get('Abstract', '')
+                formatted_abstract = format_abstract(abstract)
+                
                 search_result = SearchResult(
                     title=title,
                     authors=authors,
-                    abstract=result.get('abstract', '') or result.get('Abstract', ''),
+                    abstract=formatted_abstract,
                     link=link,
                     pdf_link=pdf_link,
                     citation_count=int(result.get('citations', 0) or result.get('Citations', 0) or 0),
@@ -299,7 +579,7 @@ class GoogleScholarScraper:
     
     async def _extract_content_from_results(self, search_results: List[SearchResult]) -> List[SearchResult]:
         """
-        Extract full content from search results
+        Extract full content from search results prioritizing PDFs
         
         Args:
             search_results (List[SearchResult]): Search results with links
@@ -307,59 +587,95 @@ class GoogleScholarScraper:
         Returns:
             List[SearchResult]: Search results with extracted content
         """
-        # Collect all URLs to extract content from
-        urls_to_extract = []
-        url_to_result_map = {}
+        # Collect URLs and prioritize PDFs based on link extension
+        pdf_urls = []
+        html_urls = []
+        url_to_results = {}
         
         for result in search_results:
-            # Prefer PDF links, then regular links
-            urls_to_try = [result.pdf_link, result.link]
-            
-            for url in urls_to_try:
-                if url and url not in url_to_result_map:
-                    urls_to_extract.append(url)
-                    if url not in url_to_result_map:
-                        url_to_result_map[url] = []
-                    url_to_result_map[url].append(result)
-                    break  # Use first available URL
+            # Check if the link has a PDF extension
+            if result.link:
+                if self._is_pdf_url(result.link):
+                    # This is a PDF link
+                    if result.link not in url_to_results:
+                        pdf_urls.append(result.link)
+                        url_to_results[result.link] = []
+                    url_to_results[result.link].append(result)
+                else:
+                    # This is a regular HTML link
+                    if result.link not in url_to_results:
+                        html_urls.append(result.link)
+                        url_to_results[result.link] = []
+                    url_to_results[result.link].append(result)
         
-        # Extract content in batches
-        batch_size = 10  # Process 10 URLs at a time
-        content_map = {}
+        logger.info(f"URLs to extract: {len(pdf_urls)} PDFs, {len(html_urls)} HTML pages")
         
-        for i in range(0, len(urls_to_extract), batch_size):
-            batch_urls = urls_to_extract[i:i + batch_size]
-            
-            logger.info(f"Extracting content from batch {i//batch_size + 1} ({len(batch_urls)} URLs)")
-            
-            batch_content = await self.extract_article_content(batch_urls)
-            content_map.update(batch_content)
-            
-            # Rate limiting between batches
-            if i + batch_size < len(urls_to_extract):
-                await asyncio.sleep(3)
+        # Extract PDFs first
+        if pdf_urls:
+            pdf_batch_size = 10  # Adjust batch size for PDFs
+            for i in range(0, len(pdf_urls), pdf_batch_size):
+                batch = pdf_urls[i:i + pdf_batch_size]
+                logger.info(f"PDF batch {i//pdf_batch_size + 1}: {len(batch)} URLs")
+                
+                batch_content = await self._extract_pdf_content(batch)
+                
+                # Update results with PDF content
+                for url, content in batch_content.items():
+                    if url in url_to_results:
+                        for result in url_to_results[url]:
+                            result.full_text = content.get("text", "")
+                            result.content_extracted = True
+                            result.extraction_scraper = content.get("scraper", "pdf_scraper")
+                            result.extraction_method = "pdf_scraper"
+                            
+                            # Update abstract if PDF provided a better one
+                            pdf_abstract = content.get("abstract", "")
+                            if pdf_abstract and len(pdf_abstract) > len(result.abstract):
+                                result.abstract = pdf_abstract
+                
+                if i + pdf_batch_size < len(pdf_urls):
+                    await asyncio.sleep(3)  # Rate limiting
         
-        # Update search results with extracted content
-        for url, content in content_map.items():
-            if url in url_to_result_map:
-                for result in url_to_result_map[url]:
-                    result.full_text = content.get("text", "")
-                    result.content_extracted = True
-                    
-                    # Update abstract if we got a better one
-                    extracted_abstract = content.get("abstract", "")
-                    if extracted_abstract and len(extracted_abstract) > len(result.abstract):
-                        result.abstract = extracted_abstract
-                    
-                    # Determine extraction method
-                    if url == result.pdf_link:
-                        result.extraction_method = "pdf"
-                    else:
-                        result.extraction_method = "web_page"
+        # Extract from HTML pages only for results without content
+        html_urls_to_extract = [url for url in html_urls 
+                               if any(not r.content_extracted for r in url_to_results[url])]
+        
+        if html_urls_to_extract:
+            cheerio_batch_size = 20
+            for i in range(0, len(html_urls_to_extract), cheerio_batch_size):
+                batch = html_urls_to_extract[i:i + cheerio_batch_size]
+                logger.info(f"HTML batch {i//cheerio_batch_size + 1}: {len(batch)} URLs")
+                
+                batch_content = await self._extract_with_cheerio(batch)
+                
+                # Update results with HTML content (only if no PDF was extracted)
+                for url, content in batch_content.items():
+                    if url in url_to_results:
+                        for result in url_to_results[url]:
+                            if not result.content_extracted:  # Only update if no PDF content
+                                result.full_text = content.get("text", "")
+                                result.content_extracted = True
+                                result.extraction_scraper = content.get("scraper", "cheerio")
+                                result.extraction_method = "cheerio_html"
+                                
+                                # Update abstract if HTML provided a better one
+                                html_abstract = content.get("abstract", "")
+                                if html_abstract and len(html_abstract) > len(result.abstract):
+                                    result.abstract = html_abstract
+                
+                if i + cheerio_batch_size < len(html_urls_to_extract):
+                    await asyncio.sleep(3)  # Rate limiting
         
         # Log extraction statistics
         total_extracted = sum(1 for r in search_results if r.content_extracted)
-        logger.info(f"Successfully extracted content from {total_extracted}/{len(search_results)} papers")
+        pdf_extracted = sum(1 for r in search_results if r.extraction_method == "pdf_scraper")
+        html_extracted = sum(1 for r in search_results if r.extraction_method == "cheerio_html")
+        
+        logger.info(f"Extraction Results:")
+        logger.info(f"  Successfully extracted: {total_extracted}/{len(search_results)} papers")
+        logger.info(f"  Success rate: {(total_extracted/len(search_results)*100) if search_results else 0:.1f}%")
+        logger.info(f"  PDF extractions: {pdf_extracted}")
+        logger.info(f"  HTML extractions: {html_extracted}")
         
         return search_results
     
@@ -374,9 +690,13 @@ class GoogleScholarScraper:
             'timestamp': datetime.now().isoformat(),
             'total_results': len(results),
             'papers_with_full_text': len([r for r in results if r.content_extracted]),
+            'pdf_extractions': len([r for r in results if r.extraction_method == "pdf_scraper"]),
+            'html_extractions': len([r for r in results if r.extraction_method == "cheerio_html"]),
             'actors_used': {
                 'scholar_search': self.scholar_actor_id,
-                'content_extraction': self.extractor_actor_id
+                'pdf_scraper': self.pdf_actor_id,  # Added PDF scraper
+                'cheerio_scraper': self.cheerio_actor_id
+                # Removed puppeteer_scraper
             },
             'results': [
                 {
@@ -391,7 +711,8 @@ class GoogleScholarScraper:
                     'full_text': r.full_text,
                     'content_extracted': r.content_extracted,
                     'extraction_method': r.extraction_method,
-                    'text_length': len(r.full_text) if r.full_text else 0
+                    'extraction_scraper': r.extraction_scraper,
+                    'text_length': r.get_text_length()
                 }
                 for r in results
             ]
@@ -408,28 +729,68 @@ class GoogleScholarScraper:
         """Get comprehensive summary statistics for search results"""
         if not results:
             return {}
-        
-        years = [r.year for r in results if r.year > 0]
-        citations = [r.citation_count for r in results]
-        text_lengths = [len(r.full_text) for r in results if r.full_text]
-        
+
+        # Extract relevant data safely
+        years = [r.year for r in results if isinstance(r.year, int) and r.year > 0]
+        citations = [r.citation_count for r in results if isinstance(r.citation_count, int)]
+        text_lengths = [r.get_text_length() for r in results if r.content_extracted]
+
+        # Count extraction methods and scrapers
+        extraction_methods = {}
+        extraction_scrapers = {}
+        for r in results:
+            if r.extraction_method:
+                extraction_methods[r.extraction_method] = extraction_methods.get(r.extraction_method, 0) + 1
+            if r.extraction_scraper:
+                extraction_scrapers[r.extraction_scraper] = extraction_scrapers.get(r.extraction_scraper, 0) + 1
+
         return {
             'total_papers': len(results),
             'papers_with_pdfs': len([r for r in results if r.pdf_link]),
             'papers_with_full_text': len([r for r in results if r.content_extracted]),
-            'extraction_success_rate': len([r for r in results if r.content_extracted]) / len(results) * 100,
+            'extraction_success_rate': (
+                len([r for r in results if r.content_extracted]) / len(results) * 100
+                if results else 0
+            ),
+            'pdf_extractions': len([r for r in results if r.extraction_method == "pdf_scraper"]),
+            'html_extractions': len([r for r in results if r.extraction_method == "cheerio_html"]),
             'average_year': sum(years) / len(years) if years else 0,
             'total_citations': sum(citations),
             'most_cited': max(citations) if citations else 0,
             'search_terms_used': len(set(r.search_term for r in results)),
             'average_text_length': sum(text_lengths) / len(text_lengths) if text_lengths else 0,
-            'extraction_methods': {
-                'pdf': len([r for r in results if r.extraction_method == 'pdf']),
-                'web_page': len([r for r in results if r.extraction_method == 'web_page']),
-                'none': len([r for r in results if not r.content_extracted])
-            },
+            'extraction_methods': extraction_methods,
+            'extraction_scrapers': extraction_scrapers,
             'actors_used': {
                 'scholar_search': self.scholar_actor_id,
-                'content_extraction': self.extractor_actor_id
+                'pdf_scraper': self.pdf_actor_id,  # Added PDF scraper
+                'cheerio_scraper': self.cheerio_actor_id
+                # Removed puppeteer_scraper
             }
         }
+
+# Example usage
+async def main():
+    """Example usage of the enhanced scraper"""
+    # Initialize with your Apify token
+    scraper = GoogleScholarScraper(apify_token="your_apify_token_here")
+    
+    # Define compound to search
+    compound = CompoundInfo(
+        name="Benzene",
+        cas_number="71-43-2",
+        synonyms=["benzol", "phenyl hydride"]
+    )
+    
+    # Run the search and extraction pipeline
+    results = await scraper.search_compound(compound, max_results_per_query=10)
+    
+    # Save results
+    scraper.save_results(results, compound.name)
+    
+    # Get summary statistics
+    stats = scraper.get_summary_stats(results)
+    print(json.dumps(stats, indent=2))
+
+if __name__ == "__main__":
+    asyncio.run(main())
