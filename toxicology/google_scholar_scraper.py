@@ -1,6 +1,7 @@
 """
 Enhanced Google Scholar Scraper with Cheerio/PDF Scrapers
 Uses Marco Gullo for Google Scholar search + jirimoravcik PDF scraper + Cheerio for content extraction
+Fixed issue with full_text being incorrectly carried over from previous results
 """
 
 import asyncio
@@ -623,15 +624,23 @@ class GoogleScholarScraper:
                 for url, content in batch_content.items():
                     if url in url_to_results:
                         for result in url_to_results[url]:
-                            result.full_text = content.get("text", "")
-                            result.content_extracted = True
-                            result.extraction_scraper = content.get("scraper", "pdf_scraper")
-                            result.extraction_method = "pdf_scraper"
-                            
-                            # Update abstract if PDF provided a better one
-                            pdf_abstract = content.get("abstract", "")
-                            if pdf_abstract and len(pdf_abstract) > len(result.abstract):
-                                result.abstract = pdf_abstract
+                            # FIXED: Check if content was actually extracted successfully
+                            if content.get("extracted", False) and content.get("text", ""):
+                                result.full_text = content.get("text", "")
+                                result.content_extracted = True
+                                result.extraction_scraper = content.get("scraper", "pdf_scraper")
+                                result.extraction_method = "pdf_scraper"
+                                
+                                # Update abstract if PDF provided a better one
+                                pdf_abstract = content.get("abstract", "")
+                                if pdf_abstract and len(pdf_abstract) > len(result.abstract):
+                                    result.abstract = pdf_abstract
+                            else:
+                                # FIXED: If extraction failed, ensure full_text is empty
+                                result.full_text = ""
+                                result.content_extracted = False
+                                result.extraction_scraper = content.get("scraper", "pdf_scraper")
+                                result.extraction_method = None
                 
                 if i + pdf_batch_size < len(pdf_urls):
                     await asyncio.sleep(3)  # Rate limiting
@@ -653,15 +662,23 @@ class GoogleScholarScraper:
                     if url in url_to_results:
                         for result in url_to_results[url]:
                             if not result.content_extracted:  # Only update if no PDF content
-                                result.full_text = content.get("text", "")
-                                result.content_extracted = True
-                                result.extraction_scraper = content.get("scraper", "cheerio")
-                                result.extraction_method = "cheerio_html"
-                                
-                                # Update abstract if HTML provided a better one
-                                html_abstract = content.get("abstract", "")
-                                if html_abstract and len(html_abstract) > len(result.abstract):
-                                    result.abstract = html_abstract
+                                # FIXED: Check if content was actually extracted
+                                if content.get("extracted", False) and content.get("text", ""):
+                                    result.full_text = content.get("text", "")
+                                    result.content_extracted = True
+                                    result.extraction_scraper = content.get("scraper", "cheerio")
+                                    result.extraction_method = "cheerio_html"
+                                    
+                                    # Update abstract if HTML provided a better one
+                                    html_abstract = content.get("abstract", "")
+                                    if html_abstract and len(html_abstract) > len(result.abstract):
+                                        result.abstract = html_abstract
+                                else:
+                                    # FIXED: If extraction failed, ensure full_text is empty
+                                    result.full_text = ""
+                                    result.content_extracted = False
+                                    result.extraction_scraper = content.get("scraper", "cheerio")
+                                    result.extraction_method = None
                 
                 if i + cheerio_batch_size < len(html_urls_to_extract):
                     await asyncio.sleep(3)  # Rate limiting
