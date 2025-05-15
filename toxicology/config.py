@@ -1,5 +1,12 @@
 """
 Configuration file for Toxicology Research API
+Purpose: Centralized configuration for all API tokens and settings
+Handles:
+
+Apify API token management
+Environment variable validation
+Default settings for max results
+Token validation and formatting
 """
 
 import os
@@ -11,7 +18,7 @@ API_PORT = 8000
 API_WORKERS = 1
 load_dotenv()
 # Apify Configuration
-APIFY_TOKEN = os.getenv("APIFY_TOKEN", "apify_api_7o1OPiuoAcBTSuk4d1sFalIubXBexM2Bnlnt")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "apify_api_Ty87IwOtIhw7jBzBurqaVGR6ZIs1z61z8ypT")
 
 # Google Scholar Scraper Settings
 GOOGLE_SCHOLAR_ACTOR_ID = "petr_cermak/google-scholar-scraper"
