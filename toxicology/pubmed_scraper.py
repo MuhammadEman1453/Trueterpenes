@@ -1,7 +1,22 @@
 """
-Europe PMC Scraper for Toxicology Research API
-Uses Europe PMC API for search and content extraction
-Compatible with existing Google Scholar scraper workflow
+Optimized Europe PMC Scraper for Toxicology Research API
+Uses Europe PMC API for search and content extraction with concurrent processing
+Optimized with ThreadPoolExecutor and async/await for faster full-text extraction
+Purpose: Europe PMC scraper using REST API with optimized XML full-text extraction
+Architecture:
+
+Phase 1: Search Europe PMC REST API
+Phase 2: Concurrent XML full-text extraction from PMC articles
+
+Features:
+
+✅ Direct API integration (no actors needed)
+✅ Concurrent full-text extraction from XML
+✅ DOI and PMCID tracking
+✅ Open access detection
+✅ Structured content parsing
+
+Optimization: Up to 15 concurrent workers for XML extraction
 """
 
 import aiohttp
@@ -14,6 +29,9 @@ import urllib.parse
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import backoff
+import random
 
 from apify_client import ApifyClient
 
@@ -29,13 +47,13 @@ EUROPE_PMC_API_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPE_PMC_ARTICLE_URL = "https://europepmc.org/article/"
 EUROPE_PMC_FULLTEXT_XML_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
-class EuropePMCScraper:
+class OptimizedEuropePMCScraper:
     """
-    Europe PMC scraper using REST API
+    Optimized Europe PMC scraper using REST API with concurrent processing
     Workflow:
     1. Search Europe PMC using REST API (with abstracts included)
     2. Extract DOI, PMC links, and check full text availability
-    3. Get full text content via XML API when available
+    3. Concurrently get full text content via XML API when available
     """
     
     # Toxicology-specific keywords
@@ -49,17 +67,21 @@ class EuropePMCScraper:
         'cannabis'
     ]
     
-    def __init__(self, apify_token: str):
+    def __init__(self, apify_token: str, max_workers: int = 15):
         """
-        Initialize the Europe PMC scraper
+        Initialize the optimized Europe PMC scraper
         
         Args:
             apify_token (str): Apify API token (kept for interface compatibility)
+            max_workers (int): Maximum concurrent workers for full-text extraction
         """
         self.session = None
+        self.max_workers = max_workers
+        self.semaphore = asyncio.Semaphore(max_workers)
         
-        logger.info("EuropePMCScraper initialized")
+        logger.info("OptimizedEuropePMCScraper initialized")
         logger.info("Using Europe PMC REST API for all content extraction")
+        logger.info(f"Max workers: {max_workers}")
     
     async def _create_session(self):
         """Create aiohttp session if not exists"""
@@ -151,23 +173,18 @@ class EuropePMCScraper:
                 # Process results
                 processed_results = []
                 for article in results:
-                    # Debug: Let's see what fields are actually in the response
-                    if len(processed_results) == 0:  # Log first article only
-                        logger.debug(f"Sample article keys: {list(article.keys())[:20]}")
-                    
                     # Extract identifiers
                     doi = article.get("doi")
                     pmid = article.get("pmid")
-                    pmcid = article.get("pmcId")  # Try different field name
+                    pmcid = article.get("pmcId")
                     
-                    # Check full text availability - let's check what fields actually exist
+                    # Check full text availability
                     has_full_text = article.get("hasFullText") == "Y" or article.get("fullTextAvailable") == "Y"
                     has_pdf = article.get("hasPDF") == "Y"
                     is_open_access = article.get("isOpenAccess") == "Y"
                     
                     # Try to get PMC ID from different places
                     if not pmcid:
-                        # Check if it's in a different field
                         pmc_id_fields = ["pmcId", "pmcid", "PMCID", "pmc"]
                         for field in pmc_id_fields:
                             if article.get(field):
@@ -180,10 +197,6 @@ class EuropePMCScraper:
                     # If source is PMC, we might already have full text access
                     if source == "PMC" and pmid:
                         pmcid = f"PMC{pmid}" if not pmcid else pmcid
-                    
-                    # Debug logging
-                    if len(processed_results) < 3:  # Log first few articles
-                        logger.debug(f"Article {pmid}: source={source}, pmcid={pmcid}, hasFullText={has_full_text}, hasPDF={has_pdf}, isOpenAccess={is_open_access}")
                     
                     # Get URLs
                     abstract_url = f"https://europepmc.org/article/{source}/{pmid}" if pmid else None
@@ -211,7 +224,7 @@ class EuropePMCScraper:
                         "source": source
                     })
                 
-                # Log summary of what we found
+                # Log summary
                 open_access_count = sum(1 for r in processed_results if r["isOpenAccess"])
                 pmc_count = sum(1 for r in processed_results if r["source"] == "PMC")
                 pmcid_count = sum(1 for r in processed_results if r["pmcid"])
@@ -249,9 +262,16 @@ class EuropePMCScraper:
         
         return authors[:10]
     
-    async def _get_full_text_xml(self, pmcid: str) -> Optional[str]:
+    @backoff.on_exception(
+        backoff.expo,
+        Exception,
+        max_tries=3,
+        max_time=30,
+        jitter=backoff.random_jitter,
+    )
+    async def _get_full_text_xml_with_backoff(self, pmcid: str) -> Optional[str]:
         """
-        Get full text content via Europe PMC XML API
+        Get full text content via Europe PMC XML API with exponential backoff
         
         Args:
             pmcid (str): PMC ID (e.g., PMC1234567)
@@ -259,84 +279,137 @@ class EuropePMCScraper:
         Returns:
             Optional[str]: Full text content if available
         """
-        try:
-            await self._create_session()
-            
-            # Make sure PMC ID has the correct format
-            if not pmcid.startswith("PMC"):
-                pmcid = f"PMC{pmcid}"
-            
-            # Use the correct endpoint format
-            xml_url = f"{EUROPE_PMC_FULLTEXT_XML_URL}/{pmcid}/fullTextXML"
-            
-            logger.info(f"Fetching full text XML from: {xml_url}")
-            
-            async with self.session.get(xml_url) as response:
-                logger.debug(f"XML API response status for {pmcid}: {response.status}")
-                if response.status == 200:
-                    xml_content = await response.text()
-                    logger.debug(f"XML content length for {pmcid}: {len(xml_content)}")
-                    
-                    # Extract text content from XML
-                    # Remove XML tags while preserving structure
-                    text_content = xml_content
-                    
-                    # Extract main text sections
-                    main_text = ""
-                    
-                    # Extract title
-                    title_match = re.search(r'<article-title>(.*?)</article-title>', text_content, re.DOTALL)
-                    if title_match:
-                        main_text += title_match.group(1) + "\n\n"
-                    
-                    # Extract abstract
-                    abstract_match = re.search(r'<abstract>(.*?)</abstract>', text_content, re.DOTALL)
-                    if abstract_match:
-                        abstract_text = re.sub(r'<[^>]+>', ' ', abstract_match.group(1))
-                        main_text += "Abstract:\n" + abstract_text + "\n\n"
-                    
-                    # Extract body sections
-                    body_match = re.search(r'<body>(.*?)</body>', text_content, re.DOTALL)
-                    if body_match:
-                        body_text = body_match.group(1)
+        async with self.semaphore:
+            try:
+                await self._create_session()
+                
+                # Make sure PMC ID has the correct format
+                if not pmcid.startswith("PMC"):
+                    pmcid = f"PMC{pmcid}"
+                
+                # Add small random delay to prevent overwhelming the server
+                await asyncio.sleep(random.uniform(0.1, 0.5))
+                
+                # Use the correct endpoint format
+                xml_url = f"{EUROPE_PMC_FULLTEXT_XML_URL}/{pmcid}/fullTextXML"
+                
+                logger.debug(f"Fetching full text XML from: {xml_url}")
+                
+                async with self.session.get(xml_url) as response:
+                    logger.debug(f"XML API response status for {pmcid}: {response.status}")
+                    if response.status == 200:
+                        xml_content = await response.text()
+                        logger.debug(f"XML content length for {pmcid}: {len(xml_content)}")
                         
-                        # Extract sections
-                        sections = re.findall(r'<sec[^>]*>(.*?)</sec>', body_text, re.DOTALL)
+                        # Extract text content from XML
+                        text_content = xml_content
                         
-                        for section in sections:
-                            # Extract section title
-                            section_title_match = re.search(r'<title>(.*?)</title>', section)
-                            if section_title_match:
-                                main_text += f"\n{section_title_match.group(1)}:\n"
+                        # Extract main text sections
+                        main_text = ""
+                        
+                        # Extract title
+                        title_match = re.search(r'<article-title>(.*?)</article-title>', text_content, re.DOTALL)
+                        if title_match:
+                            main_text += title_match.group(1) + "\n\n"
+                        
+                        # Extract abstract
+                        abstract_match = re.search(r'<abstract>(.*?)</abstract>', text_content, re.DOTALL)
+                        if abstract_match:
+                            abstract_text = re.sub(r'<[^>]+>', ' ', abstract_match.group(1))
+                            main_text += "Abstract:\n" + abstract_text + "\n\n"
+                        
+                        # Extract body sections
+                        body_match = re.search(r'<body>(.*?)</body>', text_content, re.DOTALL)
+                        if body_match:
+                            body_text = body_match.group(1)
                             
-                            # Extract paragraphs
-                            paragraphs = re.findall(r'<p>(.*?)</p>', section, re.DOTALL)
-                            for para in paragraphs:
-                                # Clean paragraph text
-                                para_text = re.sub(r'<[^>]+>', ' ', para)
-                                para_text = re.sub(r'\s+', ' ', para_text).strip()
-                                main_text += para_text + "\n\n"
-                    
-                    # Clean up the final text
-                    main_text = re.sub(r'&lt;', '<', main_text)
-                    main_text = re.sub(r'&gt;', '>', main_text)
-                    main_text = re.sub(r'&amp;', '&', main_text)
-                    main_text = re.sub(r'\s+', ' ', main_text)
-                    main_text = re.sub(r'\n{3,}', '\n\n', main_text)
-                    
-                    return format_text_content(main_text.strip())
-                    
-                else:
-                    logger.debug(f"No XML full text available for {pmcid} (status: {response.status})")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"Error getting XML full text for {pmcid}: {e}")
-            return None
+                            # Extract sections
+                            sections = re.findall(r'<sec[^>]*>(.*?)</sec>', body_text, re.DOTALL)
+                            
+                            for section in sections:
+                                # Extract section title
+                                section_title_match = re.search(r'<title>(.*?)</title>', section)
+                                if section_title_match:
+                                    main_text += f"\n{section_title_match.group(1)}:\n"
+                                
+                                # Extract paragraphs
+                                paragraphs = re.findall(r'<p>(.*?)</p>', section, re.DOTALL)
+                                for para in paragraphs:
+                                    # Clean paragraph text
+                                    para_text = re.sub(r'<[^>]+>', ' ', para)
+                                    para_text = re.sub(r'\s+', ' ', para_text).strip()
+                                    main_text += para_text + "\n\n"
+                        
+                        # Clean up the final text
+                        main_text = re.sub(r'&lt;', '<', main_text)
+                        main_text = re.sub(r'&gt;', '>', main_text)
+                        main_text = re.sub(r'&amp;', '&', main_text)
+                        main_text = re.sub(r'\s+', ' ', main_text)
+                        main_text = re.sub(r'\n{3,}', '\n\n', main_text)
+                        
+                        return format_text_content(main_text.strip())
+                        
+                    else:
+                        logger.debug(f"No XML full text available for {pmcid} (status: {response.status})")
+                        return None
+                        
+            except Exception as e:
+                logger.error(f"Error getting XML full text for {pmcid}: {e}")
+                raise  # Re-raise for backoff to retry
+    
+    async def _extract_full_texts_concurrently(self, eligible_articles: List[Dict]) -> Dict[str, str]:
+        """
+        Extract full texts from multiple articles concurrently
+        
+        Args:
+            eligible_articles (List[Dict]): Articles eligible for full text extraction
+            
+        Returns:
+            Dict[str, str]: Mapping of PMC ID to extracted full text
+        """
+        if not eligible_articles:
+            return {}
+        
+        logger.info(f"Starting concurrent full text extraction for {len(eligible_articles)} articles")
+        
+        # Create tasks for all eligible articles
+        tasks = []
+        pmcid_to_article = {}
+        
+        for article in eligible_articles:
+            pmcid = article.get("pmcid")
+            if pmcid:
+                task = self._get_full_text_xml_with_backoff(pmcid)
+                tasks.append(task)
+                pmcid_to_article[pmcid] = article
+        
+        # Execute all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        extracted_texts = {}
+        successful_extractions = 0
+        
+        for i, result in enumerate(results):
+            pmcid = list(pmcid_to_article.keys())[i]
+            
+            if isinstance(result, Exception):
+                logger.error(f"Exception extracting full text for {pmcid}: {result}")
+                continue
+            
+            if result:  # Successfully extracted text
+                extracted_texts[pmcid] = result
+                successful_extractions += 1
+                logger.info(f"Successfully extracted full text for {pmcid}")
+            else:
+                logger.warning(f"Could not extract full text for {pmcid}")
+        
+        logger.info(f"Concurrent extraction completed: {successful_extractions}/{len(eligible_articles)} successful")
+        return extracted_texts
     
     async def search_compound(self, compound: CompoundInfo, max_results_per_query: int = 20) -> List[SearchResult]:
         """
-        Complete workflow: Search Europe PMC and extract content
+        Complete workflow: Search Europe PMC and extract content with optimization
         
         Args:
             compound (CompoundInfo): Compound to search for
@@ -346,7 +419,8 @@ class EuropePMCScraper:
             List[SearchResult]: Search results with extracted content
         """
         try:
-            logger.info(f"Starting Europe PMC search for compound: {compound.name} (CAS: {compound.cas_number})")
+            start_time = time.time()
+            logger.info(f"Starting optimized Europe PMC search for compound: {compound.name} (CAS: {compound.cas_number})")
             
             # Step 1: Generate search queries
             queries = self.generate_search_queries(compound)
@@ -355,6 +429,7 @@ class EuropePMCScraper:
             all_articles = []
             seen_pmids = set()
             
+            search_start = time.time()
             for query in queries:
                 articles = await self.search_europe_pmc(query, max_results_per_query)
                 
@@ -368,31 +443,36 @@ class EuropePMCScraper:
                 # Rate limiting
                 await asyncio.sleep(0.5)
             
+            search_time = time.time() - search_start
+            logger.info(f"Search phase completed in {search_time:.2f} seconds")
             logger.info(f"Found {len(all_articles)} unique articles across all queries")
             
             if not all_articles:
                 logger.warning("No articles found in Europe PMC")
                 return []
             
-            # Step 3: Extract full text content for eligible articles
+            # Step 3: Extract full text content concurrently for eligible articles
+            extraction_start = time.time()
+            eligible_articles = [a for a in all_articles if a.get("can_get_full_text") and a.get("pmcid")]
+            logger.info(f"Articles eligible for full text extraction: {len(eligible_articles)}/{len(all_articles)}")
+            
+            # Concurrent full text extraction
+            extracted_texts = await self._extract_full_texts_concurrently(eligible_articles)
+            
+            # Update articles with extracted full text
             articles_with_full_text = 0
-            articles_eligible = sum(1 for a in all_articles if a.get("can_get_full_text"))
-            logger.info(f"Articles eligible for full text extraction: {articles_eligible}/{len(all_articles)}")
-            
             for article in all_articles:
-                if article.get("can_get_full_text") and article.get("pmcid"):
-                    logger.debug(f"Attempting to extract full text for PMC ID: {article['pmcid']}")
-                    xml_content = await self._get_full_text_xml(article["pmcid"])
-                    if xml_content:
-                        article["extracted_full_text"] = xml_content
-                        articles_with_full_text += 1
-                        logger.info(f"Successfully extracted full text for {article['pmcid']}")
-                    else:
-                        logger.warning(f"Could not extract full text for {article['pmcid']}")
+                pmcid = article.get("pmcid")
+                if pmcid and pmcid in extracted_texts:
+                    article["extracted_full_text"] = extracted_texts[pmcid]
+                    articles_with_full_text += 1
             
+            extraction_time = time.time() - extraction_start
+            logger.info(f"Extraction phase completed in {extraction_time:.2f} seconds")
             logger.info(f"Extracted full text for {articles_with_full_text} articles")
             
             # Step 4: Build search results
+            result_start = time.time()
             search_results = []
             
             for article in all_articles:
@@ -429,18 +509,24 @@ class EuropePMCScraper:
                 
                 search_results.append(search_result)
             
+            result_time = time.time() - result_start
+            
             # Close the session
             await self._close_session()
             
-            logger.info(f"Europe PMC search complete! Found {len(search_results)} papers")
+            total_time = time.time() - start_time
+            
+            logger.info(f"Optimized Europe PMC search complete! Found {len(search_results)} papers")
             logger.info(f"  With full text: {sum(1 for r in search_results if r.full_text)}")
             logger.info(f"  With abstracts only: {sum(1 for r in search_results if not r.full_text and r.abstract)}")
             logger.info(f"  With DOI: {sum(1 for r in search_results if hasattr(r, 'doi') and r.doi)}")
+            logger.info(f"Total time: {total_time:.2f} seconds")
+            logger.info(f"Processing rate: {len(search_results) / total_time:.2f} papers/second")
             
             return search_results
             
         except Exception as e:
-            logger.error(f"Error in Europe PMC search: {e}")
+            logger.error(f"Error in optimized Europe PMC search: {e}")
             await self._close_session()
             return []
     
@@ -475,28 +561,10 @@ class EuropePMCScraper:
             "average_text_length": sum(text_lengths) / len(text_lengths) if text_lengths else 0,
             "average_abstract_length": sum(abstract_lengths) / len(abstract_lengths) if abstract_lengths else 0,
             "extraction_methods": extraction_methods,
+            "optimization_enabled": True,
+            "max_workers": self.max_workers,
             "source": "Europe PMC"
         }
 
-# Example usage
-async def main():
-    """Example usage of the Europe PMC scraper"""
-    # Initialize (apify_token not used but kept for interface compatibility)
-    scraper = EuropePMCScraper(apify_token="not_used")
-    
-    # Define compound to search
-    compound = CompoundInfo(
-        name="Limonene",
-        cas_number="5989-27-5",
-        synonyms=["(+)-limonene", "d-limonene"]
-    )
-    
-    # Run the search and extraction pipeline
-    results = await scraper.search_compound(compound, max_results_per_query=10)
-    
-    # Get summary statistics
-    stats = scraper.get_summary_stats(results)
-    print(json.dumps(stats, indent=2))
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# Keep original class as alias for backward compatibility
+EuropePMCScraper = OptimizedEuropePMCScraper
