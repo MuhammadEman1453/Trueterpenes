@@ -1,6 +1,12 @@
 """
 Apify Actor Diagnostic Tool (Fixed for new token)
 Helps identify the correct actor ID and test configuration
+Purpose: Diagnostic tool to test and validate Apify actor configurations
+Features:
+Tests multiple Google Scholar actors
+Validates token functionality
+Provides working actor recommendations
+Generates code snippets for fixes
 """
 
 import asyncio
