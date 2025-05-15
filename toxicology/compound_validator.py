@@ -1,6 +1,21 @@
 """
 Compound Input Validation & Synonym Retrieval
 Validates compound input and fetches all synonyms using PubChem API
+Purpose: Validates and enriches compound input using PubChem API
+Flow:
+
+Validation: Checks compound name and CAS number format
+PubChem Lookup: Searches by name and/or CAS number
+Synonym Retrieval: Fetches all known synonyms
+Enrichment: Adds molecular formula, weight, IUPAC name
+Output: Returns validated compound with complete metadata
+
+Features:
+
+✅ Smart CAS number formatting
+✅ Multiple PubChem search strategies
+✅ Comprehensive error handling
+✅ Unicode and special character handling
 """
 
 import re
